@@ -45,7 +45,7 @@ def audio_energy(video, work):
     wav.unlink(missing_ok=True)
     return vals
 
-def detect(video, work, want_transcript, limit):
+def detect(video, work, want_transcript, limit, job_id):
     energy=audio_energy(video,work)
     duration=max((t for t,_ in energy),default=0)+5
     transcript=[]
@@ -57,7 +57,7 @@ def detect(video, work, want_transcript, limit):
             segments,_=model.transcribe(str(video), vad_filter=True)
             transcript=[{"start":s.start,"end":s.end,"text":s.text.strip()} for s in segments]
         except Exception as e:
-            JOBS[current_job]["message"]="Распознавание речи недоступно; ищем пики звука"
+            JOBS[job_id]["message"]="Распознавание речи недоступно; ищем пики звука"
     # Audio peaks are a transparent fallback, not semantic AI highlights.
     ranked=[]
     if transcript:
@@ -85,8 +85,6 @@ def detect(video, work, want_transcript, limit):
     return sorted(chosen)
 
 def process(job_id, req):
-    global current_job
-    current_job=job_id
     job=JOBS[job_id]; work=ROOT/job_id; work.mkdir(parents=True,exist_ok=True)
     try:
         job.update(status="downloading",progress=8,message="Скачиваем доступный Twitch VOD…")
@@ -100,7 +98,7 @@ def process(job_id, req):
         duration=float(probe["format"]["duration"])
         if duration<10: raise RuntimeError("Запись слишком короткая")
         job.update(status="analyzing",progress=28,message="Анализируем звук и речь…")
-        clips=detect(source,work,req.transcribe,req.limit)
+        clips=detect(source,work,req.transcribe,req.limit,job_id)
         job.update(status="exporting",progress=62,message="Экспортируем MP4-клипы в 16:9…")
         output=work/"clips";output.mkdir(exist_ok=True);items=[]
         for i,(start,end,title,score) in enumerate(clips,1):

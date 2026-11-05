@@ -34,7 +34,7 @@ def audio_energy(video, work):
     wav = work / "audio.wav"
     vals = []
     try:
-        run(["ffmpeg","-y","-i",str(video),"-vn","-ac","1","-ar","16000","-f","wav",str(wav)], timeout=1800)
+        run(["ffmpeg","-nostdin","-loglevel","error","-threads","1","-filter_threads","1","-y","-i",str(video),"-vn","-ac","1","-ar","16000","-f","wav",str(wav)], timeout=1800)
         import array
         with wave.open(str(wav), "rb") as f:
             rate = f.getframerate()
@@ -99,7 +99,7 @@ def process(job_id, req):
         work.mkdir(parents=True,exist_ok=True)
         job.update(status="downloading",progress=8,message="Скачиваем доступный Twitch VOD…")
         source=work/"source.mp4"
-        run(["yt-dlp","--no-warnings","--no-progress","--no-playlist","--merge-output-format","mp4","-f","bv*+ba/b","-o",str(work/"source.%(ext)s"),req.url],timeout=7200)
+        run(["yt-dlp","--no-warnings","--no-progress","--no-playlist","--format","bv*[height<=720]+ba/b[height<=720]/best[height<=720]","--merge-output-format","mp4","-o",str(work/"source.%(ext)s"),req.url],timeout=7200)
         found=list(work.glob("source.*"))
         found=[p for p in found if p.suffix.lower() in {".mp4",".mkv",".webm"}]
         if not found: raise RuntimeError("yt-dlp не вернул видеофайл")
@@ -113,13 +113,14 @@ def process(job_id, req):
         output=work/"clips";output.mkdir(exist_ok=True);items=[]
         for i,(start,end,title,score) in enumerate(clips,1):
             dest=output/f"closetape_{i:02d}.mp4"
-            run(["ffmpeg","-y","-ss",str(start),"-i",str(source),"-t",str(end-start),"-map","0:v:0","-map","0:a?","-vf","scale=trunc(iw/2)*2:trunc(ih/2)*2","-c:v","libx264","-preset","veryfast","-crf","18","-c:a","aac","-b:a","192k","-movflags","+faststart",str(dest)],timeout=1800)
+            run(["ffmpeg","-nostdin","-loglevel","error","-threads","1","-filter_threads","1","-y","-ss",str(start),"-i",str(source),"-t",str(end-start),"-map","0:v:0","-map","0:a?","-vf","scale=w=min(1280\\,iw):h=min(720\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2","-c:v","libx264","-preset","ultrafast","-crf","27","-threads","1","-c:a","aac","-b:a","128k","-movflags","+faststart",str(dest)],timeout=1800)
             items.append({"title":title[:100],"start":start,"end":end,"start_label":label(start),"end_label":label(end),"duration":label(end-start),"file":dest.name,"download_url":f"/api/jobs/{job_id}/clips/{dest.name}"})
         archive=work/"closetape_clips.zip"
         with zipfile.ZipFile(archive,"w",zipfile.ZIP_DEFLATED) as z:
             for p in output.glob("*.mp4"): z.write(p,p.name)
         job.update(status="done",progress=100,message="Готово",clips=items,zip_url=f"/api/jobs/{job_id}/zip")
     except Exception as e:
+        print(f"Closetape job {job_id} failed: {type(e).__name__}: {e}", flush=True)
         job.update(status="error",progress=100,message="Обработка остановлена",error=str(e)[:500])
     finally:
         JOB_SLOT.release()
@@ -134,7 +135,12 @@ def create_job(req: JobRequest):
         raise HTTPException(429,"Сервер уже обрабатывает другой стрим. Дождитесь завершения текущей задачи.")
     job_id=uuid.uuid4().hex
     JOBS[job_id]={"id":job_id,"status":"queued","progress":2,"message":"Задача создана","clips":[]}
-    threading.Thread(target=process,args=(job_id,req),daemon=True).start()
+    try:
+        threading.Thread(target=process,args=(job_id,req),daemon=True).start()
+    except Exception:
+        JOB_SLOT.release()
+        JOBS.pop(job_id, None)
+        raise
     return {"id":job_id,"status":"queued"}
 
 @app.get("/api/jobs/{job_id}")

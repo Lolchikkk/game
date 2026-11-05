@@ -23,6 +23,7 @@
 <div class="footer">CLOSETAPE CLIPMAKER · BUILT FOR CREATORS</div>
 </main>
 <script>
+window.CLOSETAPE_API = "https://closetape.onrender.com";
 const $=id=>document.getElementById(id);let poller=null;
 function setMessage(html){$('results').innerHTML=html}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}

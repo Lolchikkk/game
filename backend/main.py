@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(os.getenv("DATA_DIR", "/tmp/closetape"))
 ROOT.mkdir(parents=True, exist_ok=True)
 JOBS = {}
+JOB_SLOT = threading.BoundedSemaphore(1)  # One video-processing job at a time on small Render instances.
 app = FastAPI(title="Closetape ClipMaker API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "*").split(","), allow_methods=["GET","POST"], allow_headers=["*"])
 
@@ -29,21 +30,29 @@ def label(seconds):
     return str(timedelta(seconds=max(0,int(seconds)))) if seconds >= 3600 else str(timedelta(seconds=max(0,int(seconds))))[2:]
 
 def audio_energy(video, work):
+    """Calculate five-second RMS windows without loading the full soundtrack into RAM."""
     wav = work / "audio.wav"
-    run(["ffmpeg","-y","-i",str(video),"-vn","-ac","1","-ar","16000","-f","wav",str(wav)], timeout=1800)
-    with wave.open(str(wav),"rb") as f:
-        rate=f.getframerate(); frames=f.getnframes(); raw=f.readframes(frames)
-    import array
-    samples=array.array("h"); samples.frombytes(raw)
-    step=rate*5
-    vals=[]
-    for i in range(0,len(samples),step):
-        part=samples[i:i+step]
-        if part:
-            rms=math.sqrt(sum(x*x for x in part)/len(part))
-            vals.append((i/rate,rms))
-    wav.unlink(missing_ok=True)
-    return vals
+    vals = []
+    try:
+        run(["ffmpeg","-y","-i",str(video),"-vn","-ac","1","-ar","16000","-f","wav",str(wav)], timeout=1800)
+        import array
+        with wave.open(str(wav), "rb") as f:
+            rate = f.getframerate()
+            step = rate * 5
+            position = 0
+            while True:
+                raw = f.readframes(step)
+                if not raw:
+                    break
+                samples = array.array("h")
+                samples.frombytes(raw)
+                if samples:
+                    rms = math.sqrt(sum(x * x for x in samples) / len(samples))
+                    vals.append((position / rate, rms))
+                position += len(samples)
+        return vals
+    finally:
+        wav.unlink(missing_ok=True)
 
 def detect(video, work, want_transcript, limit, job_id):
     energy=audio_energy(video,work)
@@ -85,11 +94,12 @@ def detect(video, work, want_transcript, limit, job_id):
     return sorted(chosen)
 
 def process(job_id, req):
-    job=JOBS[job_id]; work=ROOT/job_id; work.mkdir(parents=True,exist_ok=True)
+    job=JOBS[job_id]; work=ROOT/job_id
     try:
+        work.mkdir(parents=True,exist_ok=True)
         job.update(status="downloading",progress=8,message="Скачиваем доступный Twitch VOD…")
         source=work/"source.mp4"
-        run(["yt-dlp","--no-warnings","--no-playlist","--merge-output-format","mp4","-f","bv*+ba/b","-o",str(work/"source.%(ext)s"),req.url],timeout=7200)
+        run(["yt-dlp","--no-warnings","--no-progress","--no-playlist","--merge-output-format","mp4","-f","bv*+ba/b","-o",str(work/"source.%(ext)s"),req.url],timeout=7200)
         found=list(work.glob("source.*"))
         found=[p for p in found if p.suffix.lower() in {".mp4",".mkv",".webm"}]
         if not found: raise RuntimeError("yt-dlp не вернул видеофайл")
@@ -111,6 +121,8 @@ def process(job_id, req):
         job.update(status="done",progress=100,message="Готово",clips=items,zip_url=f"/api/jobs/{job_id}/zip")
     except Exception as e:
         job.update(status="error",progress=100,message="Обработка остановлена",error=str(e)[:500])
+    finally:
+        JOB_SLOT.release()
 
 @app.get("/api/health")
 def health(): return {"ok":True,"service":"Closetape ClipMaker"}
@@ -118,6 +130,8 @@ def health(): return {"ok":True,"service":"Closetape ClipMaker"}
 @app.post("/api/jobs")
 def create_job(req: JobRequest):
     if not valid_vod(req.url): raise HTTPException(400,"Нужна прямая HTTPS-ссылка Twitch вида https://www.twitch.tv/videos/123456")
+    if not JOB_SLOT.acquire(blocking=False):
+        raise HTTPException(429,"Сервер уже обрабатывает другой стрим. Дождитесь завершения текущей задачи.")
     job_id=uuid.uuid4().hex
     JOBS[job_id]={"id":job_id,"status":"queued","progress":2,"message":"Задача создана","clips":[]}
     threading.Thread(target=process,args=(job_id,req),daemon=True).start()
